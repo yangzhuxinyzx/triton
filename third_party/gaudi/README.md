@@ -33,10 +33,10 @@ kernel[grid](..., backend_options=schedule.as_backend_options())
 `GaudiKernelArtifactV1` contains canonical metadata, the TPC ELF, and SHA-256
 digests. `TRITON_GAUDI_ARTIFACT_DIR` selects the private materialization cache;
 `TRITON_GAUDI_PERF_LIB` can override the packaged perf-library for development.
-The driver accepts a Bridge advertising launch ABI v1, or launch ABI v2 when
-that Bridge explicitly retains the v1 registration/launch compatibility
-surface. ArtifactV1 emission remains explicit and fail-closed; this is not an
-implicit conversion to the v2 envelope.
+The driver requires launch ABI v1.10 or Bridge ABI v2.1 with the v1
+registration/launch compatibility surface. ArtifactV1 emission remains
+explicit and fail-closed; this is not an implicit conversion to the v2
+envelope.
 Synapse reads `GC_KERNEL_PATH` during graph-compiler initialization, so a
 standalone Triton process must prepare the packaged perf library before its
 first HPU allocation:
@@ -59,9 +59,14 @@ static hidden sizes up to 8192. Strict matchers also cover BF16 SiLU-and-mul
 and row-wise BF16-to-E4M3 dynamic quantization with an FP32 scale output. A
 single Triton kernel can also express the common
 `SiLU(gate) * up -> BF16 rounding -> dynamic E4M3 quantization` fast path.
+The row kernels preserve logical two-dimensional input, FP8 output, and scale
+geometry so they can remain inside an `hpu_backend` graph without materializing
+flatten or output-view operations around the fixed-GUID node.
 For row widths up to 4096 columns, the backend keeps the rounded intermediate in
-VLM, machine-unrolls four 2048-bit vectors to hide sigmoid latency, and emits
-one recipe instead of writing BF16 to HBM and launching a second kernel. The
+VLM, uses the Gaudi2 no-saturation BF16 sigmoid LUT with FP32 products, and
+emits one recipe instead of writing BF16 to HBM and launching a second kernel.
+Reduction and FP8 conversion loops use two- or four-way unrolling only when the
+vector trip count is exactly divisible, avoiding unsafe TPC tail scheduling. The
 standalone quantization kernel accepts static row widths up to 16384 and uses
 the Gaudi2 bias-7 FP8 encoding and linear-lane RNE conversion. Rows requiring
 at most 8 KiB cache their BF16 input in VLM across reduction and conversion;

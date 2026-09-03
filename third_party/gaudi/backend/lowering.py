@@ -424,15 +424,40 @@ def _match_dynamic_quant(
     if scale_splat.operands != (scale_value,):
         raise GaudiLoweringError("dynamic FP8 output must divide by the emitted per-row scale")
 
-    row_mapping = [{
+    input_mapping = [{
         "tensor_dim": 0,
         "index_space_dim": 0,
-        "a": n_cols,
+        "a": 0,
         "start_b": 0,
         "end_b": n_cols - 1,
+    }, {
+        "tensor_dim": 1,
+        "index_space_dim": 0,
+        "a": 1,
+        "start_b": 0,
+        "end_b": 0,
+    }]
+    output_mapping = [{
+        "tensor_dim": 0,
+        "index_space_dim": 0,
+        "a": 0,
+        "start_b": 0,
+        "end_b": n_cols - 1,
+    }, {
+        "tensor_dim": 1,
+        "index_space_dim": 0,
+        "a": 1,
+        "start_b": 0,
+        "end_b": 0,
     }]
     scale_mapping = [{
         "tensor_dim": 0,
+        "index_space_dim": 0,
+        "a": 0,
+        "start_b": 0,
+        "end_b": 0,
+    }, {
+        "tensor_dim": 1,
         "index_space_dim": 0,
         "a": 1,
         "start_b": 0,
@@ -459,8 +484,8 @@ def _match_dynamic_quant(
             "n_cols": n_cols,
         },
         access_patterns=(
-            {"arg": 0, "role": "input", "mapping": row_mapping},
-            {"arg": 1, "role": "output", "mapping": row_mapping},
+            {"arg": 0, "role": "input", "mapping": input_mapping},
+            {"arg": 1, "role": "output", "mapping": output_mapping},
             {"arg": 2, "role": "output", "mapping": scale_mapping},
         ),
         kind="dynamic_quant",
@@ -765,19 +790,37 @@ def _match_silu_and_mul_dynamic_quant(
     input_mapping = [{
         "tensor_dim": 0,
         "index_space_dim": 0,
-        "a": 2 * n_cols,
+        "a": 0,
         "start_b": 0,
         "end_b": 2 * n_cols - 1,
+    }, {
+        "tensor_dim": 1,
+        "index_space_dim": 0,
+        "a": 1,
+        "start_b": 0,
+        "end_b": 0,
     }]
     output_mapping = [{
         "tensor_dim": 0,
         "index_space_dim": 0,
-        "a": n_cols,
+        "a": 0,
         "start_b": 0,
         "end_b": n_cols - 1,
+    }, {
+        "tensor_dim": 1,
+        "index_space_dim": 0,
+        "a": 1,
+        "start_b": 0,
+        "end_b": 0,
     }]
     scale_mapping = [{
         "tensor_dim": 0,
+        "index_space_dim": 0,
+        "a": 0,
+        "start_b": 0,
+        "end_b": 0,
+    }, {
+        "tensor_dim": 1,
         "index_space_dim": 0,
         "a": 1,
         "start_b": 0,
@@ -2511,6 +2554,20 @@ def _emit_expression(
     return name
 
 
+def _exact_loop_unroll_pragma(iterations: int) -> str:
+    if iterations <= 1:
+        return ""
+    if iterations % 4 == 0:
+        return "#pragma loop_unroll(4)"
+    if iterations % 2 == 0:
+        return "#pragma loop_unroll(2)"
+    return ""
+
+
+def _quant_loop_pragma(n_cols: int) -> str:
+    return _exact_loop_unroll_pragma((n_cols + 255) // 256)
+
+
 def _emit_dynamic_quant_tpc_c(program: GaudiProgram) -> TpcCSource:
     if program.input_args != (0,) or program.output_args != (1, 2):
         raise GaudiLoweringError("TPC-C dynamic quantization requires one input and FP8/scale outputs")
@@ -2529,6 +2586,8 @@ def _emit_dynamic_quant_tpc_c(program: GaudiProgram) -> TpcCSource:
     vlm_bytes = int((program.parameters or {}).get("vlm_bytes", -1))
     if vlm_bytes != (expected_vlm_bytes if use_vlm_cache else 0):
         raise GaudiLoweringError("TPC-C dynamic quantization has inconsistent VLM residency metadata")
+    reduction_loop_pragma = _exact_loop_unroll_pragma(n_cols // 128)
+    quant_loop_pragma = _quant_loop_pragma(n_cols)
 
     cache_declaration = ""
     cache_full_store = ""
@@ -2554,7 +2613,7 @@ __local__ bfloat128 triton_gaudi_values[TRITON_GAUDI_CACHE_CHUNKS];
             }"""
     else:
         quantization_loads = """
-            int5 first_coords = {row * n_cols + lane, 0, 0, 0, 0};
+            int5 first_coords = {lane, row, 0, 0, 0};
             const int first_remaining = n_cols - lane;
             bfloat128 first = {0};
             if (first_remaining >= TRITON_GAUDI_BF16_LANES)
@@ -2570,8 +2629,7 @@ __local__ bfloat128 triton_gaudi_values[TRITON_GAUDI_CACHE_CHUNKS];
             const int second_start = lane + TRITON_GAUDI_BF16_LANES;
             if (second_start < n_cols)
             {
-                int5 second_coords = {
-                    row * n_cols + second_start, 0, 0, 0, 0};
+                int5 second_coords = {second_start, row, 0, 0, 0};
                 const int second_remaining = n_cols - second_start;
                 if (second_remaining >= TRITON_GAUDI_BF16_LANES)
                 {
@@ -2602,11 +2660,12 @@ void main(tensor arg0, tensor arg1, tensor arg2)
     for (int row = index_space_start[0]; row < index_space_end[0]; ++row)
     {{
         float128 maximum = {{0}};
+{reduction_loop_pragma}
         for (int lane = 0;
              lane < full_columns;
              lane += TRITON_GAUDI_BF16_LANES)
         {{
-            int5 coords = {{row * n_cols + lane, 0, 0, 0, 0}};
+            int5 coords = {{lane, row, 0, 0, 0}};
             const bfloat128 values = v_bf16_ld_tnsr_b(coords, arg0);
 {cache_full_store}
             const float128 values_f32 =
@@ -2618,7 +2677,7 @@ void main(tensor arg0, tensor arg1, tensor arg2)
         }}
         if (tail_columns > 0)
         {{
-            int5 coords = {{row * n_cols + full_columns, 0, 0, 0, 0}};
+            int5 coords = {{full_columns, row, 0, 0, 0}};
             const bfloat128 values = v_bf16_ld_tnsr_partial_b(
                 coords, arg0, tail_columns - 1, 0);
 {cache_tail_store}
@@ -2636,9 +2695,10 @@ void main(tensor arg0, tensor arg1, tensor arg2)
             row_maximum, broadcast_lane_zero, 0, row_maximum);
         const float64 scale = (row_maximum + 1.0e-8f) / 240.0f;
         const float64 inverse_scale = 1.0f / scale;
-        int5 scale_coords = {{row, 0, 0, 0, 0}};
+        int5 scale_coords = {{0, row, 0, 0, 0}};
         v_f32_st_tnsr_partial(scale_coords, arg2, scale, 0, 0);
 
+{quant_loop_pragma}
         for (int lane = 0;
              lane < n_cols;
              lane += TRITON_GAUDI_FP8_LANES)
@@ -2656,7 +2716,7 @@ void main(tensor arg0, tensor arg1, tensor arg2)
             const minifloat256 quantized =
                 v_convert_f32_to_f8_all_b(
                     scaled, SW_RHNE | SW_FP8_BIAS7 | SW_LINEAR);
-            int5 output_coords = {{row * n_cols + lane, 0, 0, 0, 0}};
+            int5 output_coords = {{lane, row, 0, 0, 0}};
             const int remaining = n_cols - lane;
             if (remaining >= TRITON_GAUDI_FP8_LANES)
             {{
@@ -2698,6 +2758,8 @@ def _emit_silu_and_mul_dynamic_quant_tpc_c(program: GaudiProgram) -> TpcCSource:
             expected_vlm_bytes > 8192 or program.index_space_rank != 1):
         raise GaudiLoweringError(
             "TPC-C fused SiLU-and-mul dynamic quantization has invalid row or VLM metadata")
+    quant_loop_pragma = _quant_loop_pragma(n_cols)
+    activation_loop_pragma = _exact_loop_unroll_pragma(n_cols // 128)
 
     source = f"""// Generated by Triton Gaudi2 backend. Do not edit.
 #define TRITON_GAUDI_BLOCK_SIZE {program.block_size}
@@ -2720,24 +2782,28 @@ void main(tensor arg0, tensor arg1, tensor arg2)
     for (int row = index_space_start[0]; row < index_space_end[0]; ++row)
     {{
         float128 maximum = {{0}};
-        #pragma loop_unroll(4)
+{activation_loop_pragma}
         for (int lane = 0;
              lane < full_columns;
              lane += TRITON_GAUDI_BF16_LANES)
         {{
-            int5 gate_coords = {{row * 2 * n_cols + lane, 0, 0, 0, 0}};
-            int5 up_coords = {{row * 2 * n_cols + n_cols + lane, 0, 0, 0, 0}};
+            int5 gate_coords = {{lane, row, 0, 0, 0}};
+            int5 up_coords = {{n_cols + lane, row, 0, 0, 0}};
             const bfloat128 gate_values = v_bf16_ld_tnsr_b(gate_coords, arg0);
             const bfloat128 up_values = v_bf16_ld_tnsr_b(up_coords, arg0);
             const float128 gate_f32 =
                 convert_bfloat128_to_float128(gate_values, SW_LINEAR);
             const float128 up_f32 =
                 convert_bfloat128_to_float128(up_values, SW_LINEAR);
+            const bfloat128 sigmoid_values =
+                no_saturation_sigmoid_bf16(gate_values);
+            const float128 sigmoid_f32 =
+                convert_bfloat128_to_float128(sigmoid_values, SW_LINEAR);
             float128 result_f32 = {{0}};
             result_f32.v1 =
-                gate_f32.v1 * v_sigmoid_f32(gate_f32.v1) * up_f32.v1;
+                gate_f32.v1 * sigmoid_f32.v1 * up_f32.v1;
             result_f32.v2 =
-                gate_f32.v2 * v_sigmoid_f32(gate_f32.v2) * up_f32.v2;
+                gate_f32.v2 * sigmoid_f32.v2 * up_f32.v2;
             const bfloat128 result = convert_float128_to_bfloat128(
                 result_f32, SW_RHNE | SW_LINEAR);
             triton_gaudi_values[lane / TRITON_GAUDI_BF16_LANES] = result;
@@ -2750,9 +2816,8 @@ void main(tensor arg0, tensor arg1, tensor arg2)
         }}
         if (tail_columns > 0)
         {{
-            int5 gate_coords = {{row * 2 * n_cols + full_columns, 0, 0, 0, 0}};
-            int5 up_coords = {{
-                row * 2 * n_cols + n_cols + full_columns, 0, 0, 0, 0}};
+            int5 gate_coords = {{full_columns, row, 0, 0, 0}};
+            int5 up_coords = {{n_cols + full_columns, row, 0, 0, 0}};
             const bfloat128 gate_values = v_bf16_ld_tnsr_partial_b(
                 gate_coords, arg0, tail_columns - 1, 0);
             const bfloat128 up_values = v_bf16_ld_tnsr_partial_b(
@@ -2761,11 +2826,15 @@ void main(tensor arg0, tensor arg1, tensor arg2)
                 convert_bfloat128_to_float128(gate_values, SW_LINEAR);
             const float128 up_f32 =
                 convert_bfloat128_to_float128(up_values, SW_LINEAR);
+            const bfloat128 sigmoid_values =
+                no_saturation_sigmoid_bf16(gate_values);
+            const float128 sigmoid_f32 =
+                convert_bfloat128_to_float128(sigmoid_values, SW_LINEAR);
             float128 result_f32 = {{0}};
             result_f32.v1 =
-                gate_f32.v1 * v_sigmoid_f32(gate_f32.v1) * up_f32.v1;
+                gate_f32.v1 * sigmoid_f32.v1 * up_f32.v1;
             result_f32.v2 =
-                gate_f32.v2 * v_sigmoid_f32(gate_f32.v2) * up_f32.v2;
+                gate_f32.v2 * sigmoid_f32.v2 * up_f32.v2;
             const bfloat128 result = convert_float128_to_bfloat128(
                 result_f32, SW_RHNE | SW_LINEAR);
             triton_gaudi_values[
@@ -2784,9 +2853,10 @@ void main(tensor arg0, tensor arg1, tensor arg2)
             row_maximum, broadcast_lane_zero, 0, row_maximum);
         const float64 scale = (row_maximum + 1.0e-8f) / 240.0f;
         const float64 inverse_scale = 1.0f / scale;
-        int5 scale_coords = {{row, 0, 0, 0, 0}};
+        int5 scale_coords = {{0, row, 0, 0, 0}};
         v_f32_st_tnsr_partial(scale_coords, arg2, scale, 0, 0);
 
+{quant_loop_pragma}
         for (int lane = 0;
              lane < n_cols;
              lane += TRITON_GAUDI_FP8_LANES)
@@ -2811,7 +2881,7 @@ void main(tensor arg0, tensor arg1, tensor arg2)
             scaled.v4 = second_f32.v2 * inverse_scale;
             const minifloat256 quantized = v_convert_f32_to_f8_all_b(
                 scaled, SW_RHNE | SW_FP8_BIAS7 | SW_LINEAR);
-            int5 output_coords = {{row * n_cols + lane, 0, 0, 0, 0}};
+            int5 output_coords = {{lane, row, 0, 0, 0}};
             const int remaining = n_cols - lane;
             if (remaining >= TRITON_GAUDI_FP8_LANES)
                 v_f8_st_tnsr(output_coords, arg1, quantized);
@@ -3010,11 +3080,16 @@ void main(tensor arg0, tensor arg1)
                     convert_bfloat128_to_float128(gate_values, SW_LINEAR);
                 const float128 up_f32 =
                     convert_bfloat128_to_float128(up_values, SW_LINEAR);
+                const bfloat128 sigmoid_values =
+                    no_saturation_sigmoid_bf16(gate_values);
+                const float128 sigmoid_f32 =
+                    convert_bfloat128_to_float128(
+                        sigmoid_values, SW_LINEAR);
                 float128 result_f32 = {{0}};
                 result_f32.v1 =
-                    gate_f32.v1 * v_sigmoid_f32(gate_f32.v1) * up_f32.v1;
+                    gate_f32.v1 * sigmoid_f32.v1 * up_f32.v1;
                 result_f32.v2 =
-                    gate_f32.v2 * v_sigmoid_f32(gate_f32.v2) * up_f32.v2;
+                    gate_f32.v2 * sigmoid_f32.v2 * up_f32.v2;
                 const bfloat128 result = convert_float128_to_bfloat128(
                     result_f32, SW_RHNE | SW_LINEAR);
                 if (remaining >= TRITON_GAUDI_VECTOR_LANES)

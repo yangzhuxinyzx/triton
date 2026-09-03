@@ -12,7 +12,7 @@ namespace triton::gaudi {
 
 inline constexpr std::uint32_t kLaunchParamsMagic = 0x31475452U;
 inline constexpr std::uint16_t kLaunchAbiMajor = 1;
-inline constexpr std::uint16_t kLaunchAbiMinor = 9;
+inline constexpr std::uint16_t kLaunchAbiMinor = 10;
 inline constexpr std::size_t kArtifactHashChars = 64;
 inline constexpr std::size_t kMaxIndexSpaceRank = 5;
 inline constexpr std::size_t kMaxScalarParams = 32;

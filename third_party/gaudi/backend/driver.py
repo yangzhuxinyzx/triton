@@ -15,8 +15,8 @@ from triton.backends.driver import DriverBase
 from .artifact import GaudiKernelArtifactV1
 
 
-_LAUNCH_ABI_V1_MINOR = 9
-_LAUNCH_ABI_V2_MINOR = 0
+_LAUNCH_ABI_V1_MINOR = 10
+_LAUNCH_ABI_V2_MINOR = 1
 _LAUNCH_TARGET = "gaudi2"
 _KERNEL_GUID_V1 = "triton_gaudi2_v1"
 _KERNEL_GUID_V2 = "triton_gaudi2_v2"

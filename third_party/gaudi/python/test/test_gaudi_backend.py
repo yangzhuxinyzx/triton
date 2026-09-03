@@ -13,7 +13,12 @@ from triton._C.libtriton import ir
 from triton.backends.compiler import GPUTarget
 from triton.backends.gaudi.artifact import ArtifactError, GaudiKernelArtifactV1
 from triton.backends.gaudi.compiler import GaudiConfig, GaudiOptions
-from triton.backends.gaudi.lowering import GaudiLoweringError, emit_tpc_c, lower_ttir
+from triton.backends.gaudi.lowering import (
+    GaudiLoweringError,
+    _quant_loop_pragma,
+    emit_tpc_c,
+    lower_ttir,
+)
 from triton.compiler import ASTSource
 
 
@@ -192,9 +197,14 @@ def test_dynamic_quant_lowers_to_mixed_dtype_tpc_program():
         "scale_epsilon": 1.0e-8,
         "vlm_bytes": 1792,
     }
-    assert program.access_patterns[0]["mapping"][0]["a"] == 769
-    assert program.access_patterns[1]["mapping"][0]["a"] == 769
-    assert program.access_patterns[2]["mapping"][0]["a"] == 1
+    assert program.access_patterns[0]["mapping"][0]["a"] == 0
+    assert program.access_patterns[0]["mapping"][0]["end_b"] == 768
+    assert program.access_patterns[0]["mapping"][1]["a"] == 1
+    assert program.access_patterns[1]["mapping"][0]["a"] == 0
+    assert program.access_patterns[1]["mapping"][0]["end_b"] == 768
+    assert program.access_patterns[1]["mapping"][1]["a"] == 1
+    assert program.access_patterns[2]["mapping"][0]["a"] == 0
+    assert program.access_patterns[2]["mapping"][1]["a"] == 1
     assert program.manifest()["output_args"] == [1, 2]
     assert "gaudi.execute_dynamic_quant" in str(program)
 
@@ -206,12 +216,28 @@ def test_dynamic_quant_emits_native_fp8_reduction_tpc_c():
     assert "#define TRITON_GAUDI_CACHE_CHUNKS 7" in source
     assert "__local__ bfloat128 triton_gaudi_values[TRITON_GAUDI_CACHE_CHUNKS]" in source
     assert source.count("v_bf16_ld_tnsr_b(") == 1
+    assert "int5 coords = {lane, row, 0, 0, 0}" in source
+    assert "int5 scale_coords = {0, row, 0, 0, 0}" in source
+    assert "int5 output_coords = {lane, row, 0, 0, 0}" in source
     assert "v_f32_st_tnsr_partial(scale_coords, arg2, scale, 0, 0)" in source
     assert "scaled, SW_RHNE | SW_FP8_BIAS7 | SW_LINEAR" in source
     assert "v_f8_st_tnsr_partial" in source
     assert "1.0e-8f" in source
     assert "/ 240.0f" in source
     assert "threadIdx" not in source
+
+
+@pytest.mark.parametrize(
+    ("n_cols", "expected"),
+    [
+        (2048, "#pragma loop_unroll(4)"),
+        (3584, "#pragma loop_unroll(2)"),
+        (4096, "#pragma loop_unroll(4)"),
+        (11008, ""),
+    ],
+)
+def test_quant_loop_unroll_requires_an_exact_iteration_divisor(n_cols, expected):
+    assert _quant_loop_pragma(n_cols) == expected
 
 
 def test_dynamic_quant_wide_rows_retain_hbm_reread_fallback(tmp_path):
@@ -231,6 +257,7 @@ def test_dynamic_quant_wide_rows_retain_hbm_reread_fallback(tmp_path):
     assert program.parameters["vlm_bytes"] == 0
     assert "triton_gaudi_values" not in source
     assert source.count("v_bf16_ld_tnsr_b(") == 3
+    assert "int5 first_coords = {lane, row, 0, 0, 0}" in source
 
 
 def test_silu_and_mul_dynamic_quant_lowers_to_one_row_program():
@@ -251,19 +278,32 @@ def test_silu_and_mul_dynamic_quant_lowers_to_one_row_program():
         "scale_epsilon": 1.0e-8,
         "vlm_bytes": 7168,
     }
-    assert program.access_patterns[0]["mapping"][0]["a"] == 7168
-    assert program.access_patterns[1]["mapping"][0]["a"] == 3584
-    assert program.access_patterns[2]["mapping"][0]["a"] == 1
+    assert program.access_patterns[0]["mapping"][0]["a"] == 0
+    assert program.access_patterns[0]["mapping"][0]["end_b"] == 7167
+    assert program.access_patterns[0]["mapping"][1]["a"] == 1
+    assert program.access_patterns[1]["mapping"][0]["a"] == 0
+    assert program.access_patterns[1]["mapping"][0]["end_b"] == 3583
+    assert program.access_patterns[1]["mapping"][1]["a"] == 1
+    assert program.access_patterns[2]["mapping"][0]["a"] == 0
+    assert program.access_patterns[2]["mapping"][1]["a"] == 1
     assert "gaudi.execute_silu_and_mul_dynamic_quant" in str(program)
 
 
-def test_silu_and_mul_dynamic_quant_emits_one_fused_tpc_kernel():
+def test_silu_and_mul_dynamic_quant_emits_fast_bf16_sigmoid_tpc_kernel():
     source = str(emit_tpc_c(lower_ttir(_parse_silu_and_mul_dynamic_quant_bf16_fp8())))
 
     assert "#define TRITON_GAUDI_CACHE_CHUNKS 28" in source
     assert "__local__ bfloat128 triton_gaudi_values[TRITON_GAUDI_CACHE_CHUNKS]" in source
-    assert "gate_f32.v1 * v_sigmoid_f32(gate_f32.v1) * up_f32.v1" in source
+    assert source.count("no_saturation_sigmoid_bf16(gate_values)") == 2
+    assert "v_sigmoid_f32" not in source
+    assert "gate_f32.v1 * sigmoid_f32.v1 * up_f32.v1" in source
+    assert source.count("\n#pragma loop_unroll(4)\n") == 1
+    assert "\n#pragma loop_unroll(2)\n" in source
     assert "v_f32_reduce_max" in source
+    assert "int5 gate_coords = {lane, row, 0, 0, 0}" in source
+    assert "int5 up_coords = {n_cols + lane, row, 0, 0, 0}" in source
+    assert "int5 scale_coords = {0, row, 0, 0, 0}" in source
+    assert "int5 output_coords = {lane, row, 0, 0, 0}" in source
     assert "SW_RHNE | SW_FP8_BIAS7 | SW_LINEAR" in source
     assert "v_f8_st_tnsr_partial" in source
     assert "threadIdx" not in source
@@ -322,11 +362,12 @@ def test_silu_and_mul_lowers_to_asymmetric_row_access_pattern():
     assert "gaudi.execute_silu_and_mul" in str(program)
 
 
-def test_silu_and_mul_emits_native_f32_sigmoid_tpc_c():
+def test_silu_and_mul_emits_fast_bf16_sigmoid_with_f32_products():
     source = str(emit_tpc_c(lower_ttir(_parse_silu_and_mul_bf16())))
 
-    assert "v_sigmoid_f32(gate_f32.v1)" in source
-    assert "gate_f32.v1 * v_sigmoid_f32(gate_f32.v1) * up_f32.v1" in source
+    assert "no_saturation_sigmoid_bf16(gate_values)" in source
+    assert "v_sigmoid_f32" not in source
+    assert "gate_f32.v1 * sigmoid_f32.v1 * up_f32.v1" in source
     assert "v_bf16_ld_tnsr_partial_b" in source
     assert "v_bf16_st_tnsr_partial" in source
     assert "int5 up_coords = {n_cols + column, row, 0, 0, 0}" in source
@@ -486,7 +527,7 @@ def test_runtime_keeps_deduplicated_artifact_handle_until_last_release(monkeypat
         def _triton_gaudi_launch_abi():
             return {
                 "major": 1,
-                "minor": 9,
+                "minor": 10,
                 "target": "gaudi2",
                 "kernel_guid": "triton_gaudi2_v1",
                 "graph_op": True,
@@ -558,7 +599,7 @@ def test_bridge_launch_abi_mismatch_fails_closed():
         def _triton_gaudi_launch_abi():
             return {
                 "major": 2,
-                "minor": 0,
+                "minor": 1,
                 "target": "gaudi3",
                 "kernel_guid": "different",
                 "graph_op": False,
@@ -578,7 +619,7 @@ def test_bridge_launch_abi_v2_accepts_explicit_v1_compatibility_surface():
         def _triton_gaudi_launch_abi():
             return {
                 "major": 2,
-                "minor": 0,
+                "minor": 1,
                 "target": "gaudi2",
                 "kernel_guid": "triton_gaudi2_v2",
                 "graph_op": True,
@@ -587,6 +628,28 @@ def test_bridge_launch_abi_v2_accepts_explicit_v1_compatibility_surface():
             }
 
     assert driver_module.validate_bridge_launch_abi(CompatibleV2Bridge())["major"] == 2
+
+
+def test_bridge_launch_abi_v2_requires_logical_row_output_geometry():
+    class FlatOutputV2Bridge:
+        _triton_gaudi_register_artifact = object()
+        _triton_gaudi_unregister_artifact = object()
+        _triton_gaudi_launch = object()
+
+        @staticmethod
+        def _triton_gaudi_launch_abi():
+            return {
+                "major": 2,
+                "minor": 0,
+                "target": "gaudi2",
+                "kernel_guid": "triton_gaudi2_v2",
+                "graph_op": True,
+                "artifact_abi": 2,
+                "typed_scalars": True,
+            }
+
+    with pytest.raises(RuntimeError, match="minor=0"):
+        driver_module.validate_bridge_launch_abi(FlatOutputV2Bridge())
 
 
 def test_bridge_launch_abi_v2_without_v1_compatibility_fails_closed():
@@ -623,7 +686,7 @@ def test_runtime_packs_f32_scalar_parameters_as_ieee_bits(monkeypatch):
         def _triton_gaudi_launch_abi():
             return {
                 "major": 1,
-                "minor": 9,
+                "minor": 10,
                 "target": "gaudi2",
                 "kernel_guid": "triton_gaudi2_v1",
                 "graph_op": True,
